@@ -1,6 +1,7 @@
 """
 AECHO - Main Entry Point
 Abubakar's Enhanced Cognitive Handling Operator
+Connects brain, voice, intro, and wake word modules together.
 """
 
 from kivy.app import App
@@ -11,19 +12,22 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.button import Button
 from kivy.graphics import Color, Rectangle
 from kivy.core.window import Window
-from kivy.clock import Clock
+from kivy.clock import Clock, mainthread
+
+import brain
+import voice
+import intro
+from wakeword import WakeWordListener, listen_for_command
 
 # Theme colors - black and gray
-COLOR_BG = (0.05, 0.05, 0.05, 1)        # near-black background
-COLOR_BUBBLE_AI = (0.18, 0.18, 0.18, 1)  # dark gray for AECHO's messages
-COLOR_BUBBLE_USER = (0.28, 0.28, 0.28, 1)  # lighter gray for user messages
-COLOR_TEXT = (0.9, 0.9, 0.9, 1)          # off-white text
-COLOR_ACCENT = (0.5, 0.5, 0.5, 1)        # mid gray accent
+COLOR_BG = (0.05, 0.05, 0.05, 1)
+COLOR_BUBBLE_AI = (0.18, 0.18, 0.18, 1)
+COLOR_BUBBLE_USER = (0.28, 0.28, 0.28, 1)
+COLOR_TEXT = (0.9, 0.9, 0.9, 1)
+COLOR_ACCENT = (0.5, 0.5, 0.5, 1)
 
 
 class ChatBubble(Label):
-    """A single chat message bubble, styled based on sender."""
-
     def __init__(self, text, is_ai=True, **kwargs):
         super().__init__(**kwargs)
         self.text = text
@@ -50,8 +54,6 @@ class ChatBubble(Label):
 
 
 class AechoRoot(BoxLayout):
-    """Root layout: chat history + input bar."""
-
     def __init__(self, **kwargs):
         super().__init__(orientation='vertical', **kwargs)
 
@@ -60,7 +62,11 @@ class AechoRoot(BoxLayout):
             self.bg_rect = Rectangle(pos=self.pos, size=self.size)
         self.bind(pos=self._update_bg, size=self._update_bg)
 
-        # Scrollable chat area
+        self.memory = brain.load_memory()
+        self.awaiting_setup_name = False
+        self.awaiting_setup_password = False
+        self.pending_owner_name = None
+
         self.scroll = ScrollView(size_hint=(1, 0.88))
         self.chat_log = BoxLayout(
             orientation='vertical',
@@ -72,7 +78,6 @@ class AechoRoot(BoxLayout):
         self.scroll.add_widget(self.chat_log)
         self.add_widget(self.scroll)
 
-        # Input bar
         input_bar = BoxLayout(size_hint=(1, 0.12), padding=8, spacing=8)
 
         self.text_input = TextInput(
@@ -97,7 +102,10 @@ class AechoRoot(BoxLayout):
         input_bar.add_widget(send_btn)
         self.add_widget(input_bar)
 
-        # First-boot intro will hook in here later (intro.py)
+        # Start wake word listener in the background
+        self.wake_listener = WakeWordListener(on_wake_detected=self.on_wake_detected)
+        self.wake_listener.start()
+
         Clock.schedule_once(self.boot_sequence, 0.5)
 
     def _update_bg(self, *args):
@@ -105,8 +113,13 @@ class AechoRoot(BoxLayout):
         self.bg_rect.size = self.size
 
     def boot_sequence(self, dt):
-        """Placeholder - intro.py will handle real first-boot logic."""
-        self.add_message("Hello world, I just born.", is_ai=True)
+        """Runs intro logic on startup - first boot or returning owner."""
+        intro_text = intro.run_intro(self.memory)
+        self.add_message(intro_text, is_ai=True)
+
+        if brain.is_first_run(self.memory):
+            self.awaiting_setup_name = True
+            self.add_message("What is your name?", is_ai=True)
 
     def on_send(self, *args):
         user_text = self.text_input.text.strip()
@@ -114,8 +127,40 @@ class AechoRoot(BoxLayout):
             return
         self.add_message(user_text, is_ai=False)
         self.text_input.text = ""
-        # brain.py will handle actual response logic later
-        self.add_message("[brain.py not connected yet]", is_ai=True)
+        self.handle_user_input(user_text)
+
+    def handle_user_input(self, user_text):
+        """Routes input either into first-time setup flow or normal brain logic."""
+        if self.awaiting_setup_name:
+            self.pending_owner_name = user_text
+            self.awaiting_setup_name = False
+            self.awaiting_setup_password = True
+            self.add_message("Set a password for me.", is_ai=True)
+            return
+
+        if self.awaiting_setup_password:
+            self.awaiting_setup_password = False
+            response = intro.complete_first_setup(
+                self.memory, self.pending_owner_name, user_text
+            )
+            self.add_message(response, is_ai=True)
+            return
+
+        # Normal conversation, once setup is done
+        response = brain.process_input(self.memory, user_text)
+        self.add_message(response, is_ai=True)
+        voice.speak(response)
+
+    @mainthread
+    def on_wake_detected(self):
+        """Called from the background wake word thread when 'AECHO' is heard."""
+        self.add_message("(wake word detected, listening...)", is_ai=True)
+        command = listen_for_command()
+        if command:
+            self.add_message(command, is_ai=False)
+            self.handle_user_input(command)
+        else:
+            self.add_message("I didn't catch that.", is_ai=True)
 
     def add_message(self, text, is_ai=True):
         bubble = ChatBubble(text=text, is_ai=is_ai)
